@@ -8,6 +8,24 @@
 # https://github.com/armbian/build/
 
 #############################################################################################################
+# Detect the container engine binary: docker, nerdctl, or podman.
+# Sets CONTAINER_ENGINE global. Called early by get_docker_info_once().
+function detect_container_engine() {
+	if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
+		return 0 # already detected
+	fi
+	declare -g CONTAINER_ENGINE=""
+	declare -g DOCKER_IS_NERDCTL=""
+	if [[ -n "$(command -v docker)" ]]; then
+		CONTAINER_ENGINE="docker"
+	elif [[ -n "$(command -v nerdctl)" ]]; then
+		CONTAINER_ENGINE="nerdctl"
+		DOCKER_IS_NERDCTL="yes"
+		display_alert "Using nerdctl as container engine" "nerdctl detected" "info"
+	fi
+}
+
+#############################################################################################################
 # @TODO: called by no-one, yet.
 function check_and_install_docker_daemon() {
 	# @TODO: sincerely, not worth keeping this. Send user to Docker install docs. `adduser $USER docker` is important on Linux.
@@ -37,30 +55,38 @@ function check_and_install_docker_daemon() {
 	fi
 }
 
-# "docker info" is expensive to run, so cache it. output globals DOCKER_INFO and DOCKER_INFO_OK=yes/no
+# "docker/nerdctl info" is expensive to run, so cache it. output globals DOCKER_INFO and DOCKER_INFO_OK=yes/no
 function get_docker_info_once() {
 	if [[ -z "${DOCKER_INFO}" ]]; then
+		# Detect which container engine binary to use (docker or nerdctl)
+		detect_container_engine
+
 		declare -g DOCKER_INFO
 		declare -g DOCKER_IN_PATH="no"
 		declare -g DOCKER_IS_PODMAN
 
-		# if "docker" is in the PATH...
-		if [[ -n "$(command -v docker)" ]]; then
-			display_alert "Docker is in the path" "Docker in PATH" "debug"
+		# if a container engine is in the PATH...
+		if [[ -n "${CONTAINER_ENGINE}" ]]; then
+			display_alert "Container engine is in the path" "${CONTAINER_ENGINE} in PATH" "debug"
 			DOCKER_IN_PATH="yes"
 		fi
 
-		# Shenanigans to go around error control & capture output in the same effort.
-		DOCKER_INFO="$({ docker info 2> /dev/null && echo "DOCKER_INFO_OK"; } || true)"
+		if [[ -z "${CONTAINER_ENGINE}" ]]; then
+			DOCKER_INFO=""
+		else
+			# Shenanigans to go around error control & capture output in the same effort.
+			DOCKER_INFO="$({ ${CONTAINER_ENGINE} info 2> /dev/null && echo "DOCKER_INFO_OK"; } || true)"
+		fi
 		declare -g -r DOCKER_INFO="${DOCKER_INFO}" # readonly
 
-		if docker --version | grep -q podman; then
+		if [[ -n "${CONTAINER_ENGINE}" ]] && ${CONTAINER_ENGINE} --version 2>/dev/null | grep -q podman; then
 			DOCKER_IS_PODMAN="yes"
 		# when `docker` is a shim to `podman`, it will report its version as "podman version #.#.#"
 		else
 			DOCKER_IS_PODMAN=""
 		fi
 		declare -g -r DOCKER_IS_PODMAN="${DOCKER_IS_PODMAN}" # readonly
+		declare -g -r DOCKER_IS_NERDCTL="${DOCKER_IS_NERDCTL:-}" # readonly
 
 
 		declare -g DOCKER_INFO_OK="no"
@@ -83,8 +109,9 @@ function is_docker_ready_to_go() {
 		display_alert "Can't use Docker" "Actually ALREADY UNDER DOCKER!" "debug"
 		return 1
 	fi
-	if [[ -z "$(command -v docker)" ]]; then
-		display_alert "Can't use Docker" "docker command not found" "debug"
+	detect_container_engine
+	if [[ -z "${CONTAINER_ENGINE}" ]]; then
+		display_alert "Can't use container engine" "neither docker nor nerdctl found" "debug"
 		return 1
 	fi
 
@@ -107,8 +134,8 @@ function cli_handle_docker() {
 	# Purge Armbian Docker images
 	if [[ "${1}" == dockerpurge && -f /etc/debian_version ]]; then
 		display_alert "Purging Armbian Docker containers" "" "wrn"
-		docker container ls -a | grep armbian | awk '{print $1}' | xargs docker container rm &> /dev/null
-		docker image ls | grep armbian | awk '{print $3}' | xargs docker image rm &> /dev/null
+		${CONTAINER_ENGINE} container ls -a | grep armbian | awk '{print $1}' | xargs ${CONTAINER_ENGINE} container rm &> /dev/null
+		${CONTAINER_ENGINE} image ls | grep armbian | awk '{print $3}' | xargs ${CONTAINER_ENGINE} image rm &> /dev/null
 		# removes "dockerpurge" from $1, thus $2 becomes $1
 		shift
 		set -- "docker" "$@"
@@ -150,7 +177,7 @@ function docker_cli_prepare() {
 	#############################################################################################################
 	# Stop here if Docker can't be used at all.
 	if ! is_docker_ready_to_go; then
-		display_alert "Docker is not ready" "Docker is not available. Make sure you've Docker installed, configured, and running; add your user to the 'docker' group and restart your shell too." "err"
+		display_alert "Container engine is not ready" "Neither Docker nor nerdctl is available. Make sure you have a container engine installed, configured, and running." "err"
 		exit 56
 	fi
 
@@ -186,11 +213,16 @@ function docker_cli_prepare() {
 
 	declare -g DOCKER_HAS_BUILDX=no
 	declare -g -a DOCKER_BUILDX_OR_BUILD=("build")
-	if [[ -n "${DOCKER_BUILDX_VERSION}" ]]; then
+	if [[ "${DOCKER_IS_NERDCTL}" == "yes" ]]; then
+		# nerdctl uses BuildKit natively, no buildx subcommand needed
+		DOCKER_HAS_BUILDX=yes
+		DOCKER_BUILDX_OR_BUILD=("build" "--progress=plain")
+		display_alert "nerdctl uses BuildKit natively" "no buildx subcommand needed" "debug"
+	elif [[ -n "${DOCKER_BUILDX_VERSION}" ]]; then
 		DOCKER_HAS_BUILDX=yes
 		DOCKER_BUILDX_OR_BUILD=("buildx" "build" "--progress=plain" "--load")
 	fi
-	display_alert "Docker has buildx?" "${DOCKER_HAS_BUILDX}" "debug"
+	display_alert "Container engine has buildx?" "${DOCKER_HAS_BUILDX}" "debug"
 
 	DOCKER_SERVER_NAME_HOST="$(echo "${DOCKER_INFO}" | grep -i -e "name:" | cut -d ":" -f 2 | xargs echo -n)"
 	display_alert "Docker Server Hostname" "${DOCKER_SERVER_NAME_HOST}" "debug"
@@ -336,7 +368,7 @@ function docker_cli_build_dockerfile() {
 
 	if [[ "${do_force_pull}" == "no" ]]; then
 		# Check if the base image is up to date.
-		local_image_sha="$(docker images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
+		local_image_sha="$(${CONTAINER_ENGINE} images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
 		display_alert "Checking if base image exists at all" "local_image_sha: '${local_image_sha}'" "debug"
 		if [[ -n "${local_image_sha}" ]]; then
 			display_alert "Armbian docker image" "already exists: ${DOCKER_ARMBIAN_BASE_IMAGE}" "info"
@@ -349,10 +381,10 @@ function docker_cli_build_dockerfile() {
 	if [[ "${do_force_pull:-yes}" == "yes" ]]; then
 		display_alert "Pulling" "${DOCKER_ARMBIAN_BASE_IMAGE}" "info"
 		local pull_failed="yes"
-		run_host_command_logged docker pull "${DOCKER_ARMBIAN_BASE_IMAGE}" && pull_failed="no"
+		run_host_command_logged ${CONTAINER_ENGINE} pull "${DOCKER_ARMBIAN_BASE_IMAGE}" && pull_failed="no"
 
 		if [[ "${pull_failed}" == "no" ]]; then
-			local_image_sha="$(docker images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
+			local_image_sha="$(${CONTAINER_ENGINE} images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
 			display_alert "New local image sha after pull" "local_image_sha: ${local_image_sha}" "debug"
 			# print current date and time in epoch format; touches mtime of file
 			echo "${DOCKER_ARMBIAN_BASE_IMAGE}|${local_image_sha}|$(date +%s)" >> "${docker_marker_dir}"/last-pull
@@ -373,7 +405,7 @@ function docker_cli_build_dockerfile() {
 	display_alert "Building" "Dockerfile via '${DOCKER_BUILDX_OR_BUILD[*]}'" "info"
 
 	BUILDKIT_COLORS="run=123,20,245:error=yellow:cancel=blue:warning=white" \
-		run_host_command_logged docker "${DOCKER_BUILDX_OR_BUILD[@]}" -t "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" -f "${SRC}"/Dockerfile "${SRC}"
+		run_host_command_logged ${CONTAINER_ENGINE} "${DOCKER_BUILDX_OR_BUILD[@]}" -t "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" -f "${SRC}"/Dockerfile "${SRC}"
 }
 
 function docker_cli_prepare_launch() {
@@ -513,19 +545,30 @@ function docker_cli_prepare_launch() {
 		case "${docker_kind}" in
 			anonymous)
 				display_alert "Mounting" "anonymous volume for '${MOUNT_DIR}'" "debug"
-				# type=volume, without source=, is an anonymous volume -- will be auto cleaned up together with the container;
-				# this could also be a type=tmpfs if you had enough ram - but armbian already does tmpfs for you if you
-				#                                                         have enough RAM (inside the container) so don't bother.
-				DOCKER_ARGS+=("--mount" "type=volume,destination=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}${DOCKER_IS_PODMAN:+,exec,dev}")
+				if [[ "${DOCKER_IS_NERDCTL}" == "yes" ]]; then
+					# nerdctl: use -v for shorter label footprint (avoids 4096-byte label limit)
+					DOCKER_ARGS+=("-v" "${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+				else
+					# type=volume, without source=, is an anonymous volume -- will be auto cleaned up together with the container;
+					DOCKER_ARGS+=("--mount" "type=volume,destination=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}${DOCKER_IS_PODMAN:+,exec,dev}")
+				fi
 				;;
 			bind)
 				display_alert "Mounting" "bind mount for '${MOUNT_DIR}'" "debug"
 				mkdir -p "${SRC}/${MOUNT_DIR}"
-				DOCKER_ARGS+=("--mount" "type=bind,source=${SRC}/${MOUNT_DIR},target=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+				if [[ "${DOCKER_IS_NERDCTL}" == "yes" ]]; then
+					DOCKER_ARGS+=("-v" "${SRC}/${MOUNT_DIR}:${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+				else
+					DOCKER_ARGS+=("--mount" "type=bind,source=${SRC}/${MOUNT_DIR},target=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+				fi
 				;;
 			namedvolume)
 				display_alert "Mounting" "named volume id '${volume_id}' for '${MOUNT_DIR}'" "debug"
-				DOCKER_ARGS+=("--mount" "type=volume,source=armbian-${volume_id},destination=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}${DOCKER_IS_PODMAN:+,exec,dev}")
+				if [[ "${DOCKER_IS_NERDCTL}" == "yes" ]]; then
+					DOCKER_ARGS+=("-v" "armbian-${volume_id}:${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+				else
+					DOCKER_ARGS+=("--mount" "type=volume,source=armbian-${volume_id},destination=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}${DOCKER_IS_PODMAN:+,exec,dev}")
+				fi
 				;;
 			*)
 				display_alert "Unknown Mountpoint Type" "unknown volume type '${docker_kind}' for '${MOUNT_DIR}'" "err"
@@ -539,26 +582,35 @@ function docker_cli_prepare_launch() {
 	# @TODO: auto-compute this list; just get the dirs and filter some out?
 	for MOUNT_DIR in "lib" "config" "extensions" "packages" "patch" "tools" "userpatches"; do
 		mkdir -p "${SRC}/${MOUNT_DIR}"
-		DOCKER_ARGS+=("--mount" "type=bind,source=${SRC}/${MOUNT_DIR},target=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+		if [[ "${DOCKER_IS_NERDCTL}" == "yes" ]]; then
+			DOCKER_ARGS+=("-v" "${SRC}/${MOUNT_DIR}:${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+		else
+			DOCKER_ARGS+=("--mount" "type=bind,source=${SRC}/${MOUNT_DIR},target=${DOCKER_ARMBIAN_TARGET_PATH}/${MOUNT_DIR}")
+		fi
 	done
 
 	if [[ "${DOCKER_SERVER_REQUIRES_LOOP_HACKS}" == "yes" ]]; then
 		display_alert "Adding /dev/loop* hacks for" "${DOCKER_ARMBIAN_HOST_OS_UNAME}" "debug"
-		DOCKER_ARGS+=("--security-opt=apparmor:unconfined") # mounting things inside the container on Ubuntu won't work without this https://github.com/moby/moby/issues/16429#issuecomment-217126586
-		DOCKER_ARGS+=(--device-cgroup-rule='b 7:* rmw')     # allow loop devices (not required)
-		DOCKER_ARGS+=(--device-cgroup-rule='b 259:* rmw')   # allow loop device partitions
-		DOCKER_ARGS+=(-v /dev:/tmp/dev:ro)                  # this is an ugly hack (CONTAINER_COMPAT=y), but it is required to get /dev/loopXpY minor number for mknod inside the container, and container itself still uses private /dev internally
-
-		if [[ "${DOCKER_SERVER_USE_STATIC_LOOPS}" == "yes" ]]; then
-			for loop_device_host in "/dev/loop-control" "/dev/loop0" "/dev/loop1" "/dev/loop2" "/dev/loop3" "/dev/loop4" "/dev/loop5" "/dev/loop6" "/dev/loop7"; do # static list; "host" is not real, there's a VM intermediary
-				display_alert "Passing through host loop device to Docker" "static: ${loop_device_host}" "debug"
-				DOCKER_ARGS+=("--device=${loop_device_host}")
-			done
+		if [[ "${DOCKER_IS_NERDCTL}" == "yes" ]]; then
+			# nerdctl: --privileged grants device access; mount /dev/:/tmp/dev for loop device minor numbers
+			DOCKER_ARGS+=(-v /dev:/tmp/dev:ro)
 		else
-			for loop_device_host in /dev/loop*; do # pass through loop devices from host to container; includes `loop-control`
-				display_alert "Passing through host loop device to Docker" "host: ${loop_device_host}" "debug"
-				DOCKER_ARGS+=("--device=${loop_device_host}")
-			done
+			DOCKER_ARGS+=("--security-opt=apparmor:unconfined") # mounting things inside the container on Ubuntu won't work without this https://github.com/moby/moby/issues/16429#issuecomment-217126586
+			DOCKER_ARGS+=(--device-cgroup-rule='b 7:* rmw')     # allow loop devices (not required)
+			DOCKER_ARGS+=(--device-cgroup-rule='b 259:* rmw')   # allow loop device partitions
+			DOCKER_ARGS+=(-v /dev:/tmp/dev:ro)                  # this is an ugly hack (CONTAINER_COMPAT=y), but it is required to get /dev/loopXpY minor number for mknod inside the container, and container itself still uses private /dev internally
+
+			if [[ "${DOCKER_SERVER_USE_STATIC_LOOPS}" == "yes" ]]; then
+				for loop_device_host in "/dev/loop-control" "/dev/loop0" "/dev/loop1" "/dev/loop2" "/dev/loop3" "/dev/loop4" "/dev/loop5" "/dev/loop6" "/dev/loop7"; do # static list; "host" is not real, there's a VM intermediary
+					display_alert "Passing through host loop device to Docker" "static: ${loop_device_host}" "debug"
+					DOCKER_ARGS+=("--device=${loop_device_host}")
+				done
+			else
+				for loop_device_host in /dev/loop*; do # pass through loop devices from host to container; includes `loop-control`
+					display_alert "Passing through host loop device to Docker" "host: ${loop_device_host}" "debug"
+					DOCKER_ARGS+=("--device=${loop_device_host}")
+				done
+			fi
 		fi
 
 	else
@@ -613,13 +665,13 @@ function docker_cli_launch() {
 	# The amount of privileges and capabilities given is a bare minimum needed for losetup to work
 	if [[ ! -e /dev/loop0 ]]; then
 		display_alert "Running losetup in a temporary container" "because no loop devices exist" "info"
-		run_host_command_logged docker run --rm --privileged --cap-add=MKNOD "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /usr/sbin/losetup -f
+		run_host_command_logged ${CONTAINER_ENGINE} run --rm --privileged --cap-add=MKNOD "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /usr/sbin/losetup -f
 	fi
 
 	display_alert "-----------------Relaunching in Docker after ${SECONDS}s------------------" "here comes the 🐳" "info"
 
 	local -i docker_build_result
-	if docker run "${DOCKER_ARGS[@]}" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /bin/bash "${DOCKER_ARMBIAN_TARGET_PATH}/compile.sh" "${ARMBIAN_CLI_FINAL_RELAUNCH_ARGS[@]}"; then
+	if ${CONTAINER_ENGINE} run "${DOCKER_ARGS[@]}" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /bin/bash "${DOCKER_ARMBIAN_TARGET_PATH}/compile.sh" "${ARMBIAN_CLI_FINAL_RELAUNCH_ARGS[@]}"; then
 		docker_build_result=$? # capture exit code of test done in the line above.
 		display_alert "-------------Docker run finished after ${SECONDS}s------------------------" "🐳 successful" "info"
 	else
@@ -651,8 +703,8 @@ function docker_purge_deprecated_volumes() {
 	for mountpoint in "${ARMBIAN_MOUNTPOINTS_DEPRECATED[@]}"; do
 		local volume_id="armbian-${mountpoint//\//-}"
 		display_alert "Purging deprecated Docker volume" "${volume_id}" "info"
-		if docker volume inspect "${volume_id}" &> /dev/null; then
-			run_host_command_logged docker volume rm "${volume_id}"
+		if ${CONTAINER_ENGINE} volume inspect "${volume_id}" &> /dev/null; then
+			run_host_command_logged ${CONTAINER_ENGINE} volume rm "${volume_id}"
 			display_alert "Purged deprecated Docker volume" "${volume_id} OK" "info"
 		else
 			display_alert "Deprecated Docker volume not found" "${volume_id} OK" "info"
@@ -666,27 +718,27 @@ function docker_cleanup_old_images() {
 	display_alert "Cleaning old Docker images" "removing dangling and keeping only 2 most recent per tag" "info"
 
 	# Remove dangling images (layers with no tags)
-	display_alert "Pruning dangling images" "docker image prune -f" "debug"
-	docker image prune -f > /dev/null 2>&1 || true
+	display_alert "Pruning dangling images" "${CONTAINER_ENGINE} image prune -f" "debug"
+	${CONTAINER_ENGINE} image prune -f > /dev/null 2>&1 || true
 
 	# For each armbian image tag, keep only the 2 most recent
 	declare image_tags=()
 	while IFS= read -r line; do
 		image_tags+=("$line")
-	done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep "docker-armbian-build" | sort -u)
+	done < <(${CONTAINER_ENGINE} images --format '{{.Repository}}:{{.Tag}}' | grep "docker-armbian-build" | sort -u)
 
 	for image_tag in "${image_tags[@]}"; do
 		# Get all image IDs for this tag, sorted by creation date (newest first)
 		declare -a image_ids=()
 		while IFS= read -r line; do
 			image_ids+=("$line")
-		done < <(docker images --format '{{.ID}} {{.CreatedAt}}' "${image_tag}" | sort -r -k2,2 -k3,3 -k4,4 -k5,5 | awk '{print $1}')
+		done < <(${CONTAINER_ENGINE} images --format '{{.ID}} {{.CreatedAt}}' "${image_tag}" | sort -r -k2,2 -k3,3 -k4,4 -k5,5 | awk '{print $1}')
 
 		# Remove images beyond the first 2 (keep newest 2)
 		if [[ ${#image_ids[@]} -gt 2 ]]; then
 			for ((i=2; i<${#image_ids[@]}; i++)); do
 				display_alert "Removing old image" "${image_tag}:${image_ids[$i]}" "debug"
-				docker rmi "${image_ids[$i]}" > /dev/null 2>&1 || true
+				${CONTAINER_ENGINE} rmi "${image_ids[$i]}" > /dev/null 2>&1 || true
 			done
 		fi
 	done
@@ -707,12 +759,12 @@ function docker_pull_with_marker() {
 
 	run_host_command_logged mkdir -p "${docker_marker_dir}"
 
-	display_alert "Pulling Docker image" "${image_name}" "info"
+	display_alert "Pulling container image" "${image_name}" "info"
 
-	if docker pull "${image_name}"; then
+	if ${CONTAINER_ENGINE} pull "${image_name}"; then
 		# Update marker file after successful pull
 		declare local_image_sha
-		local_image_sha="$(docker images --no-trunc --quiet "${image_name}")"
+		local_image_sha="$(${CONTAINER_ENGINE} images --no-trunc --quiet "${image_name}")"
 		if [[ -n "${local_image_sha}" ]]; then
 			echo "${image_name}|${local_image_sha}|$(date +%s)" >> "${docker_marker_dir}"/last-pull
 			display_alert "Updated pull marker" "${image_name}" "debug"
@@ -746,11 +798,21 @@ function docker_setup_auto_pull_cronjob() {
 	wrapper_content=$(cat <<- 'EOT'
 	#!/usr/bin/env bash
 	# Auto-generated by Armbian build framework
-	# Pulls Docker images and updates markers to prevent unnecessary re-pulls
+	# Pulls container images and updates markers to prevent unnecessary re-pulls
 	# DO NOT EDIT MANUALLY - this file is regenerated by the build system
 
 	set -e
 	set -o pipefail
+
+	# Detect container engine
+	if command -v docker &>/dev/null; then
+		CONTAINER_ENGINE="docker"
+	elif command -v nerdctl &>/dev/null; then
+		CONTAINER_ENGINE="nerdctl"
+	else
+		echo "No container engine found (docker or nerdctl)" | logger -t armbian-docker-pull
+		exit 1
+	fi
 
 	SRC="__SRC_PLACEHOLDER__"
 	MARKER_DIR="${SRC}/cache/docker"
@@ -773,10 +835,10 @@ function docker_setup_auto_pull_cronjob() {
 
 		log "Pulling Docker image: ${image_name}"
 
-		if docker pull "${image_name}" 2>&1 | logger -t armbian-docker-pull; then
+		if ${CONTAINER_ENGINE} pull "${image_name}" 2>&1 | logger -t armbian-docker-pull; then
 			# Update marker file after successful pull
 			local local_image_sha
-			local_image_sha="$(docker images --no-trunc --quiet "${image_name}")"
+			local_image_sha="$(${CONTAINER_ENGINE} images --no-trunc --quiet "${image_name}")"
 			if [[ -n "${local_image_sha}" ]]; then
 				echo "${image_name}|${local_image_sha}|$(date +%s)" >> "${MARKER_DIR}/last-pull"
 				log "Updated pull marker for: ${image_name}"

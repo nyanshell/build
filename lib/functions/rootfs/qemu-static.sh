@@ -151,10 +151,80 @@ function prepare_host_binfmt_qemu_cross() {
 			if [[ "${host_arch}" == "aarch64" && "${wanted_arch}" == "arm" ]]; then
 				prepare_host_binfmt_qemu_cross_arm64_host_armhf_target
 			else
-				run_host_command_logged update-binfmts --enable "qemu-${wanted_arch}" "&>" "/dev/null" || display_alert "Failed to update binfmts" "update-binfmts --enable qemu-${wanted_arch}" "err" # log & continue on failure
+				run_host_command_logged update-binfmts --enable "qemu-${wanted_arch}" "&>" "/dev/null" || {
+					display_alert "Failed to update binfmts" "update-binfmts --enable qemu-${wanted_arch}" "wrn"
+					# Fallback: if the binfmt database entry is missing (e.g. container with namespaced
+					# binfmt_misc and systemd-binfmt based qemu-user-static), create it and retry.
+					if [[ ! -e "/proc/sys/fs/binfmt_misc/qemu-${wanted_arch}" && -x "/usr/bin/qemu-${wanted_arch}-static" ]]; then
+						display_alert "Attempting direct binfmt registration" "qemu-${wanted_arch}" "info"
+						prepare_host_binfmt_register_directly "qemu-${wanted_arch}" "/usr/bin/qemu-${wanted_arch}-static"
+					fi
+				}
 			fi
 		fi
 	done
+}
+
+# Directly register a binfmt entry by creating the /usr/share/binfmts/ database file
+# and importing it. This is needed when running inside containers with namespaced binfmt_misc
+# (kernel 6.7+) where the host's binfmt entries are not visible and the qemu-user-static
+# package uses systemd-binfmt instead of binfmt-support for registration.
+function prepare_host_binfmt_register_directly() {
+	local binfmt_name="${1}" interpreter="${2}"
+
+	# Define magic bytes and masks for each architecture (standard ELF headers)
+	declare -A binfmt_magic=(
+		["qemu-arm"]='\x7f\x45\x4c\x46\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00'
+		["qemu-aarch64"]='\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00'
+		["qemu-x86_64"]='\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00'
+		["qemu-riscv64"]='\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xf3\x00'
+		["qemu-loongarch64"]='\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x02\x01'
+	)
+	declare -A binfmt_mask=(
+		["qemu-arm"]='\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
+		["qemu-aarch64"]='\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
+		["qemu-x86_64"]='\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
+		["qemu-riscv64"]='\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
+		["qemu-loongarch64"]='\xff\xff\xff\xff\xff\xff\xff\xfc\x00\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
+	)
+
+	local magic="${binfmt_magic[${binfmt_name}]}"
+	local mask="${binfmt_mask[${binfmt_name}]}"
+
+	if [[ -z "${magic}" || -z "${mask}" ]]; then
+		display_alert "No magic bytes defined for" "${binfmt_name}" "wrn"
+		return 1
+	fi
+
+	# Create the binfmt-support database file
+	display_alert "Creating binfmt database entry" "${binfmt_name}" "info"
+	cat <<-BINFMT_MAGIC >/usr/share/binfmts/${binfmt_name}
+		package qemu-user-static
+		interpreter ${interpreter}
+		magic ${magic}
+		offset 0
+		mask ${mask}
+		credentials yes
+		fix_binary yes
+		preserve yes
+	BINFMT_MAGIC
+	run_host_command_logged update-binfmts --import "${binfmt_name}" || true
+	run_host_command_logged update-binfmts --enable "${binfmt_name}" || {
+		display_alert "update-binfmts --enable still failed, trying direct register" "${binfmt_name}" "wrn"
+		# Last resort: write directly to the register file
+		echo ":${binfmt_name}:M::${magic}:${mask}:${interpreter}:PF" > /proc/sys/fs/binfmt_misc/register 2>&1 || {
+			display_alert "Direct binfmt registration also failed" "${binfmt_name}" "err"
+			return 1
+		}
+	}
+	# Verify
+	if [[ -e "/proc/sys/fs/binfmt_misc/${binfmt_name}" ]]; then
+		display_alert "binfmt entry registered successfully" "${binfmt_name}" "info"
+	else
+		display_alert "binfmt entry still not registered" "${binfmt_name}" "err"
+		return 1
+	fi
+	return 0
 }
 
 function prepare_host_binfmt_qemu_cross_arm64_host_armhf_target() {

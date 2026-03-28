@@ -140,6 +140,7 @@ function kernel_prepare_build_and_package() {
 	build_targets_install=("${KERNEL_INSTALL_TYPE:-install}")
 
 	install_make_params_quoted+=("INSTALL_MOD_STRIP=1") # strip modules during install
+	install_make_params_quoted+=("INSTALLKERNEL=none") # bypass /sbin/installkernel, use arch-specific install.sh
 
 	build_targets_install+=("modules_install")
 	build_targets_install+=("headers_install") # headers_install for libc headers

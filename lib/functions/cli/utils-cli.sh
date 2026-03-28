@@ -241,23 +241,23 @@ function cli_standard_relaunch_docker_or_sudo() {
 		# 2) We could ask for sudo (which _might_ require a password)...
 		# @TODO: GitHub actions can do both. Sudo without password _and_ Docker; should we prefer Docker? Might have unintended consequences...
 
-		get_docker_info_once # Get Docker info once, and cache it; calling "docker info" is expensive
+		get_docker_info_once # Get container engine info once, and cache it; calling "info" is expensive
 
 		if [[ "${DOCKER_INFO_OK}" == "yes" ]]; then
 			if [[ "${PREFER_DOCKER:-yes}" == "yes" ]]; then
-				display_alert "not root, but Docker is ready to go" "delegating to Docker" "debug"
+				display_alert "not root, but container engine is ready to go" "delegating to ${CONTAINER_ENGINE:-docker}" "debug"
 				ARMBIAN_CHANGE_COMMAND_TO="docker"
 				ARMBIAN_CLI_RELAUNCH_COMMAND="${ARMBIAN_COMMAND}" # add params when relaunched under docker
 				return 0
 			else
-				display_alert "not root, but Docker is ready to go" "but PREFER_DOCKER is set to 'no', so can't use it" "warn"
+				display_alert "not root, but container engine is ready to go" "but PREFER_DOCKER is set to 'no', so can't use it" "warn"
 			fi
 		else
 			if [[ "${DOCKER_IN_PATH:-no}" == "yes" ]]; then
 				if [[ "${PREFER_DOCKER:-yes}" == "no" ]]; then
 					: # congrats, don't have it, didn't wanna it.
 				else
-					display_alert "Docker is installed, but not usable" "can't use Docker; check your Docker config / groups / etc" "warn"
+					display_alert "Container engine is installed, but not usable" "can't use it; check your config / groups / etc" "warn"
 					exit_if_countdown_not_aborted 10 "Docker installed but not usable"
 				fi
 			fi

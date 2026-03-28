@@ -88,8 +88,8 @@ function cli_docker_run() {
 
 	case "${DOCKER_SUBCMD}" in
 		shell)
-			display_alert "Launching Docker shell" "docker-shell" "info"
-			docker run -it "${DOCKER_ARGS[@]}" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /bin/bash
+			display_alert "Launching container shell" "${CONTAINER_ENGINE}-shell" "info"
+			${CONTAINER_ENGINE} run -it "${DOCKER_ARGS[@]}" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /bin/bash
 			;;
 
 		purge)
