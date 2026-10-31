@@ -22,9 +22,7 @@ index 271f93399193..b6fc8329cf45 100644
 +static const struct panel_desc clockwork_cpi3_lcd = {
 +	.modes = &clockwork_cpi3_lcd_mode,
 +	.num_modes = 1,
-+	.bpc = 6,
-+	.bus_format = MEDIA_BUS_FMT_RGB666_1X18,
-+	.connector_type = DRM_MODE_CONNECTOR_DPI,
++	.bpc = 8,
 +};
 +
 +static const struct drm_display_mode clockwork_cpi3_hdmi_mode = {

@@ -1,0 +1,38 @@
+From: ClockworkPi local kernel review
+Subject: [PATCH] video: kd027: restore vendor serial data setup before clock pulse
+
+The DRM-panel conversion in cpi3-006 moved the falling SCK edge before
+the SDA update. Clockwork's vendor driver drives SDA while SCK is high,
+then pulses SCK low and high. The conversion therefore stopped providing
+the same data setup time before the falling edge.
+
+Restore the vendor's order and add a one-microsecond setup interval.
+Keep the existing low/high hold delays, register bytes and chip select
+framing. This makes each transmitted bit stable before either edge,
+without assuming an undocumented KD027 sampling edge.
+
+test-003 still flickers and shows more white horizontal lines than
+test-002 according to the user's hardware report. This patch corrects
+an observed waveform difference; it does not establish that serial
+sampling is the cause of that display corruption. Keep test-003's
+pixel clock and mode unchanged to isolate this test.
+
+Reference: clockworkpi/Kernel CPI3_linux_4.20/cpi3_linux_4_20_1902.patch,
+kd027_write_lcd().
+https://github.com/clockworkpi/Kernel/blob/master/CPI3_linux_4.20/cpi3_linux_4_20_1902.patch
+
+diff --git a/drivers/video/backlight/kd027_lcd.c b/drivers/video/backlight/kd027_lcd.c
+--- a/drivers/video/backlight/kd027_lcd.c
++++ b/drivers/video/backlight/kd027_lcd.c
+@@ -34,8 +34,10 @@
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < 8; i++) {
++		/* Match the vendor waveform: data precedes both clock edges. */
++		gpiod_set_value_cansleep(lcd->sda, !!(data & 0x80));
++		udelay(1);
+ 		gpiod_set_value_cansleep(lcd->sck, 0);
+-		gpiod_set_value_cansleep(lcd->sda, !!(data & 0x80));
+ 		udelay(1);
+ 		gpiod_set_value_cansleep(lcd->sck, 1);
+ 		udelay(1);

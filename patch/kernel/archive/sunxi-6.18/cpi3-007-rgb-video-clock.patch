@@ -1,0 +1,77 @@
+From: ClockworkPi local kernel review
+Subject: [PATCH] clk: sunxi-ng: keep CPI3 RGB dotclock on PLL-VIDEO
+
+On test-002 the running CPI3 clock tree was:
+  pll-video 87 MHz -> pll-mipi 5.8 MHz -> lcd-ch0 -> tcon-data-clock.
+The final pixel clock is nominally correct, but the extra low-frequency
+PLL stage is a suspect for the persistent image flicker.
+
+For this board only, select PLL-VIDEO and prohibit automatic LCD parent
+changes. Apply its documented 30..600 MHz range. The existing TCON divider
+can then generate 5.8 MHz from a 46.4 MHz PLL-VIDEO clock (divide by eight).
+Do not infer the R16 PLL-MIPI limits from the different A64 SoC.
+
+This is a board-scoped hardware test workaround, not a proven flicker fix.
+Reference: Allwinner R16 User Manual v1.2, PLL_VIDEO_CTRL_REG (page 39).
+https://linux-sunxi.org/images/c/ca/Allwinner_R16_User_Manual_V1.2.pdf
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun8i-a33.c b/drivers/clk/sunxi-ng/ccu-sun8i-a33.c
+--- a/drivers/clk/sunxi-ng/ccu-sun8i-a33.c
++++ b/drivers/clk/sunxi-ng/ccu-sun8i-a33.c
+@@ -3,7 +3,9 @@
+  * Copyright (c) 2016 Maxime Ripard. All rights reserved.
+  */
+ 
++#include <linux/clk.h>
+ #include <linux/clk-provider.h>
++#include <linux/of.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+@@ -424,6 +426,20 @@
+ 				     lcd_ch0_parents, lcd_ch0_table,
+ 				     0x118, 24, 3, BIT(31),
+ 				     CLK_SET_RATE_PARENT);
++
++/*
++ * CPI3 has a low-dotclock RGB panel. Automatic reparenting can select
++ * PLL-MIPI itself at 5.8 MHz with a TCON divisor of one. Keep the LCD
++ * on PLL-VIDEO and let the TCON divider produce the panel dotclock.
++ * Other A33 boards retain automatic parent selection.
++ */
++static const struct clk_init_data cpi3_lcd_ch0_init = {
++	.name = "lcd-ch0",
++	.ops = &ccu_mux_ops,
++	.parent_names = lcd_ch0_parents,
++	.num_parents = ARRAY_SIZE(lcd_ch0_parents),
++	.flags = CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
++};
+ 
+ static const char * const lcd_ch1_parents[] = { "pll-video", "pll-video-2x" };
+ static const u8 lcd_ch1_table[] = { 0, 2 };
+@@ -805,9 +821,25 @@
+ 	val &= ~BIT(16);
+ 	writel(val, reg + SUN8I_A33_PLL_MIPI_REG);
+ 
++	if (of_machine_is_compatible("clockwork,clockworkpi-cpi3")) {
++		lcd_ch0_clk.common.hw.init = &cpi3_lcd_ch0_init;
++		/* R16 User Manual v1.2, PLL_VIDEO_CTRL_REG: 30..600 MHz. */
++		pll_video_clk.common.min_rate = 30000000;
++		pll_video_clk.common.max_rate = 600000000;
++	}
++
+ 	ret = devm_sunxi_ccu_probe(&pdev->dev, reg, &sun8i_a33_ccu_desc);
+ 	if (ret)
+ 		return ret;
++
++	if (of_machine_is_compatible("clockwork,clockworkpi-cpi3")) {
++		ret = clk_set_parent(lcd_ch0_clk.common.hw.clk,
++				     pll_video_clk.common.hw.clk);
++		if (ret)
++			return dev_err_probe(&pdev->dev, ret,
++					     "CPI3 LCD video PLL parent\n");
++		dev_info(&pdev->dev, "CPI3 RGB LCD uses PLL-VIDEO without automatic reparenting\n");
++	}
+ 
+ 	/* Gate then ungate PLL CPU after any rate changes */
+ 	ccu_pll_notifier_register(&sun8i_a33_pll_cpu_nb);

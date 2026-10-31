@@ -1,0 +1,137 @@
+From: Local GameShell kernel work <local@localhost>
+Subject: [PATCH] drm/sun4i: apply observed CPI3 white-source startup workaround
+
+On the tested CPI3, normal scanout remained corrupt after boot until
+TCON0 source was switched from DE0 to all-one test data for 100 ms and
+back to DE0. A standalone trial after a fresh boot repeated the
+recovery; an earlier recovery stayed clear for more than ten minutes.
+A 100 ms black-only trial was reported ineffective. The underlying
+mechanism is not established.
+
+Repeat the observed white-source transition after the KD027 panel has
+been enabled, with active TCON clocks. Scope it to CPI3, A33 TCON and
+KD027 panel. Validate the active RGB/DE0 state, preserve all other
+bits, check source readback and attempt source restoration even after
+a selection error. The normal modeset path serializes this synchronous
+operation; each output enable (including resume) repeats it. A short
+white flash may be visible.
+
+This is a hardware-test candidate, not a confirmed boot fix. It does
+not change clocks, timing, polarity, panel register values or assert
+FIFO reset.
+
+---
+diff --git a/drivers/gpu/drm/sun4i/sun4i_rgb.c b/drivers/gpu/drm/sun4i/sun4i_rgb.c
+--- a/drivers/gpu/drm/sun4i/sun4i_rgb.c
++++ b/drivers/gpu/drm/sun4i/sun4i_rgb.c
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
+ 
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_bridge.h>
+@@ -156,6 +159,85 @@
+ 	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+ };
+ 
++/* Source 5 is all-one test data on R16; other SoCs may differ. */
++#define SUN8I_R16_TCON0_SRC_WHITE 5
++
++static int sun4i_rgb_cpi3_white_pulse(struct sun4i_rgb *rgb)
++{
++	struct sun4i_tcon *tcon = rgb->tcon;
++	unsigned int gctl, ctl, dclk, lvds, value;
++	int ret, restore_ret;
++
++	if (!of_machine_is_compatible("clockwork,clockworkpi-cpi3") ||
++	    !of_device_is_compatible(tcon->dev->of_node,
++				     "allwinner,sun8i-a33-tcon") ||
++	    !rgb->panel ||
++	    !of_device_is_compatible(rgb->panel->dev->of_node,
++				     "clockwork,cpi3-kd027"))
++		return 0;
++
++	if (!rgb->panel->prepared || !rgb->panel->enabled)
++		return -EINVAL;
++
++	ret = regmap_read(tcon->regs, SUN4I_TCON_GCTL_REG, &gctl);
++	if (ret)
++		return ret;
++	ret = regmap_read(tcon->regs, SUN4I_TCON0_CTL_REG, &ctl);
++	if (ret)
++		return ret;
++	ret = regmap_read(tcon->regs, SUN4I_TCON0_DCLK_REG, &dclk);
++	if (ret)
++		return ret;
++	ret = regmap_read(tcon->regs, SUN4I_TCON0_LVDS_IF_REG, &lvds);
++	if (ret)
++		return ret;
++
++	/* Only pulse an active RGB channel currently fed by DE0. */
++	if (!(gctl & SUN4I_TCON_GCTL_TCON_ENABLE) ||
++	    (gctl & SUN4I_TCON_GCTL_IOMAP_MASK) ||
++	    !(ctl & SUN4I_TCON0_CTL_TCON_ENABLE) ||
++	    (ctl & (SUN4I_TCON0_CTL_IF_MASK | SUN4I_TCON0_CTL_SRC_SEL_MASK)) ||
++	    !(dclk & BIT(SUN4I_TCON0_DCLK_GATE_BIT)) ||
++	    (lvds & SUN4I_TCON0_LVDS_IF_EN))
++		return -EINVAL;
++
++	/*
++	 * On CPI3, a 100 ms white source followed by DE0 restored stable
++	 * scanout during live tests, including after a fresh boot. Apply it
++	 * after panel enable, matching that tested state. The mechanism is
++	 * not established; this is not an explicit FIFO reset. Leave all
++	 * clock, timing, polarity and other control bits unchanged.
++	 */
++	ret = regmap_update_bits(tcon->regs, SUN4I_TCON0_CTL_REG,
++				 SUN4I_TCON0_CTL_SRC_SEL_MASK,
++				 SUN8I_R16_TCON0_SRC_WHITE);
++	if (!ret) {
++		ret = regmap_read(tcon->regs, SUN4I_TCON0_CTL_REG, &value);
++		if (!ret && (value & SUN4I_TCON0_CTL_SRC_SEL_MASK) !=
++			    SUN8I_R16_TCON0_SRC_WHITE)
++			ret = -EIO;
++		if (!ret)
++			msleep(100);
++	}
++
++	/* Attempt restoration even if selecting white or its readback failed. */
++	restore_ret = regmap_update_bits(tcon->regs, SUN4I_TCON0_CTL_REG,
++					 SUN4I_TCON0_CTL_SRC_SEL_MASK, 0);
++	if (restore_ret)
++		return restore_ret;
++	restore_ret = regmap_read(tcon->regs, SUN4I_TCON0_CTL_REG, &value);
++	if (restore_ret)
++		return restore_ret;
++	if (value & SUN4I_TCON0_CTL_SRC_SEL_MASK)
++		return -EIO;
++
++	if (!ret)
++		dev_info(tcon->dev,
++			 "CPI3 RGB startup: 100 ms white pulse, framebuffer restored\n");
++
++	return ret;
++}
++
+ static void sun4i_rgb_encoder_enable(struct drm_encoder *encoder)
+ {
+ 	struct sun4i_rgb *rgb = drm_encoder_to_sun4i_rgb(encoder);
+@@ -163,8 +245,14 @@
+ 	DRM_DEBUG_DRIVER("Enabling RGB output\n");
+ 
+ 	if (rgb->panel) {
++		int ret;
++
+ 		drm_panel_prepare(rgb->panel);
+ 		drm_panel_enable(rgb->panel);
++		ret = sun4i_rgb_cpi3_white_pulse(rgb);
++		if (ret)
++			dev_err(rgb->tcon->dev,
++				"CPI3 RGB startup white pulse failed: %d\n", ret);
+ 	}
+ }
+ 
